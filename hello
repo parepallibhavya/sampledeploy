@@ -1,1 +1,794 @@
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+DataStage XML Column Lineage Extractor — CORRECTED FOR REAL DATASTAGE EXPORTS
+================================================================================
+
+Based on actual IBM InfoSphere DataStage XML export format:
+  - Stages are <Record Type="CustomStage"> (not SubRecord)
+  - StageType has PX suffix (e.g., OracleConnectorPX)
+  - Links defined via Partner property on output/input pins
+  - Columns in <Collection Name="Columns" Type="OutputColumn">
+  - SqlType uses numeric codes (12=VARCHAR, etc.)
+
+EXCEL OUTPUT:
+    Source Column Name | Source Data Type | Extraction Logic | Target Column Name | Target Data Type
+
+USAGE:
+    python ds_lineage_corrected.py --input your_file.xml --output lineage.xlsx
+
+REQUIREMENTS:
+    pip install pandas openpyxl
+================================================================================
+"""
+
+import xml.etree.ElementTree as ET
+import argparse
+import os
+import sys
+import re
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    import pandas as pd
+except ImportError:
+    print("\n" + "=" * 60)
+    print("ERROR: pandas is required. Install: pip install pandas openpyxl")
+    print("=" * 60)
+    sys.exit(1)
+
+
+# =============================================================================
+# SQL TYPE MAPPING (numeric codes to names)
+# =============================================================================
+
+SQL_TYPE_MAP = {
+    "1": "Char",
+    "2": "Numeric",
+    "3": "Decimal",
+    "4": "Integer",
+    "5": "SmallInt",
+    "6": "Float",
+    "7": "Real",
+    "8": "Double",
+    "9": "Date",
+    "10": "Time",
+    "11": "TimeStamp",
+    "12": "VarChar",
+    "13": "LongVarChar",
+    "14": "Binary",
+    "15": "VarBinary",
+    "16": "LongVarBinary",
+    "17": "BigInt",
+    "18": "TinyInt",
+    "19": "Bit",
+    "20": "WChar",
+    "21": "WVarChar",
+    "22": "WLongVarChar",
+    "91": "Date",
+    "92": "Time",
+    "93": "TimeStamp",
+    "-1": "LongVarChar",
+    "-2": "Binary",
+    "-3": "VarBinary",
+    "-4": "LongVarBinary",
+    "-5": "BigInt",
+    "-6": "TinyInt",
+    "-7": "Bit",
+    "-8": "WChar",
+    "-9": "WVarChar",
+    "-10": "WLongVarChar",
+}
+
+
+def map_sql_type(code):
+    if not code:
+        return ""
+    code_str = str(code).strip()
+    return SQL_TYPE_MAP.get(code_str, f"Type({code_str})")
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def clean_stage_type(raw: str) -> str:
+    """Clean stage type - remove PX/Px suffix/prefix."""
+    if not raw:
+        return "Unknown"
+    # Remove Px prefix
+    if raw.startswith("Px"):
+        raw = raw[2:]
+    # Remove PX suffix
+    if raw.endswith("PX"):
+        raw = raw[:-2]
+    return raw
+
+
+def format_dtype(sql_type_code, precision, scale) -> str:
+    sql_type = map_sql_type(sql_type_code)
+    if not sql_type:
+        return ""
+    p = str(precision).strip() if precision else ""
+    s = str(scale).strip() if scale else ""
+    if p and s:
+        return f"{sql_type}({p},{s})"
+    elif p:
+        return f"{sql_type}({p})"
+    return sql_type
+
+
+def ci_match(name1: str, name2: str) -> bool:
+    return str(name1).strip().lower() == str(name2).strip().lower()
+
+
+# =============================================================================
+# XML PARSER — CORRECTED FOR REAL DATASTAGE FORMAT
+# =============================================================================
+
+class DataStageParser:
+    """
+    Parses actual IBM DataStage XML export format.
+
+    Structure:
+      <DSExport>
+        <Job>
+          <Record Identifier="ROOT" Type="JobDefn">...</Record>
+          <Record Identifier="V0" Type="ContainerView">...</Record>
+          <Record Identifier="V0S0" Type="CustomStage">
+            <Property Name="Name">StageName</Property>
+            <Property Name="StageType">OracleConnectorPX</Property>
+            <Record Identifier="V0S0P1" Type="CustomOutput">
+              <Property Name="Name">OutputPinName</Property>
+              <Property Name="Partner">V0S9|V0S9P2</Property>
+              <Collection Name="Columns" Type="OutputColumn">
+                <SubRecord>
+                  <Property Name="Name">INVOICE_NUMBER</Property>
+                  <Property Name="SqlType">12</Property>
+                  ...
+                </SubRecord>
+              </Collection>
+            </Record>
+          </Record>
+    """
+
+    def __init__(self, xml_path: str):
+        self.xml_path = xml_path
+        self.tree = ET.parse(xml_path)
+        self.root = self.tree.getroot()
+        self.stages = []          # List of stage dicts
+        self.links = []           # List of link dicts
+        self.stage_by_name = {}   # stage_name -> stage dict
+        self.stage_by_id = {}     # record_id (e.g., V0S0) -> stage dict
+        self.link_by_name = {}    # link_name -> link dict
+        self.incoming = defaultdict(list)   # stage_name -> [links]
+        self.outgoing = defaultdict(list)   # stage_name -> [links]
+        self._parse()
+
+    def _extract_properties(self, elem) -> dict:
+        """Extract all Property elements from an XML element."""
+        props = {}
+        for prop in elem.findall("Property"):
+            name = prop.get("Name")
+            val = prop.text
+            if name:
+                props[name] = val
+        return props
+
+    def _extract_collections(self, elem) -> dict:
+        """Extract all Collection elements from an XML element."""
+        cols = defaultdict(list)
+        for coll in elem.findall("Collection"):
+            cname = coll.get("Name")
+            if not cname:
+                continue
+            for sub in coll.findall("SubRecord"):
+                item = self._extract_properties(sub)
+                if item:
+                    cols[cname].append(item)
+        return cols
+
+    def _parse(self):
+        """Parse the XML to find stages, pins, columns, and build links."""
+        job = self.root.find(".//Job")
+        if job is None:
+            job = self.root
+
+        # Find all Records that are stages (Type="CustomStage")
+        for record in job.findall("Record"):
+            rec_type = record.get("Type", "")
+            rec_id = record.get("Identifier", "")
+
+            if rec_type == "CustomStage":
+                self._parse_stage(record, rec_id)
+
+        # Build links from Partner properties on output/input pins
+        self._build_links_from_pins()
+
+    def _parse_stage(self, record, rec_id: str):
+        """Parse a single stage Record."""
+        stage = {
+            "Properties": self._extract_properties(record),
+            "Collections": defaultdict(list),
+            "Pins": [],           # Output/Input pins
+            "_record_id": rec_id,
+        }
+
+        stage_name = stage["Properties"].get("Name", "")
+        stage_type = stage["Properties"].get("StageType", "")
+        stage["_raw_type"] = stage_type
+        stage["CleanStageType"] = clean_stage_type(stage_type)
+
+        # Parse Collections directly under stage
+        stage["Collections"] = self._extract_collections(record)
+
+        # Parse Pins (CustomOutput / CustomInput records inside stage)
+        for pin in record.findall("Record"):
+            pin_type = pin.get("Type", "")
+            pin_id = pin.get("Identifier", "")
+            if pin_type in ("CustomOutput", "CustomInput"):
+                pin_data = {
+                    "Type": pin_type,
+                    "Identifier": pin_id,
+                    "Properties": self._extract_properties(pin),
+                    "Collections": self._extract_collections(pin),
+                }
+                stage["Pins"].append(pin_data)
+
+        self.stages.append(stage)
+        if stage_name:
+            self.stage_by_name[stage_name] = stage
+        self.stage_by_id[rec_id] = stage
+
+    def _build_links_from_pins(self):
+        """Build links from Partner properties on pins."""
+        for stage in self.stages:
+            stage_name = stage["Properties"].get("Name", "")
+            stage_id = stage["_record_id"]
+
+            for pin in stage["Pins"]:
+                if pin["Type"] == "CustomOutput":
+                    partner = pin["Properties"].get("Partner", "")
+                    if not partner:
+                        continue
+
+                    # Partner format: "TargetStageID|TargetPinID" e.g., "V0S9|V0S9P2"
+                    # Can also have multiple partners separated by "|"
+                    parts = partner.split("|")
+                    if len(parts) >= 2:
+                        target_stage_id = parts[0]
+                        target_pin_id = parts[1] if len(parts) > 1 else ""
+
+                        target_stage = self.stage_by_id.get(target_stage_id)
+                        if target_stage:
+                            target_stage_name = target_stage["Properties"].get("Name", "")
+
+                            # Create a link
+                            link_name = pin["Properties"].get("Name", f"Link_{stage_id}_{target_stage_id}")
+                            link = {
+                                "Properties": {
+                                    "LinkName": link_name,
+                                    "FromStage": stage_name,
+                                    "ToStage": target_stage_name,
+                                    "FromPin": pin["Identifier"],
+                                    "ToPin": target_pin_id,
+                                },
+                                "Collections": pin["Collections"],  # Columns are on the pin!
+                            }
+
+                            self.links.append(link)
+                            self.link_by_name[link_name] = link
+                            if stage_name:
+                                self.outgoing[stage_name].append(link)
+                            if target_stage_name:
+                                self.incoming[target_stage_name].append(link)
+
+    def get_sources(self):
+        """Stages with no incoming links."""
+        return [s for s in self.stages if not self.incoming.get(s["Properties"].get("Name"))]
+
+    def get_targets(self):
+        """Stages with no outgoing links."""
+        return [s for s in self.stages if not self.outgoing.get(s["Properties"].get("Name"))]
+
+
+# =============================================================================
+# STAGE LOGIC EXTRACTOR
+# =============================================================================
+
+class LogicExtractor:
+    @staticmethod
+    def extract(stage: dict) -> str:
+        stype = stage.get("CleanStageType", "")
+        props = stage["Properties"]
+        cols = stage["Collections"]
+        parts = []
+
+        if "Transformer" in stype:
+            for item in cols.get("Derivations", []):
+                cname = item.get("ColumnName", item.get("Name", ""))
+                expr = item.get("Expression", item.get("Derivation", ""))
+                if cname and expr:
+                    parts.append(f"DERIVE: {cname} = {expr}")
+            for item in cols.get("Constraints", []):
+                lnk = item.get("LinkName", "")
+                expr = item.get("Expression", "")
+                if expr:
+                    parts.append(f"FILTER [{lnk}]: {expr}")
+            for item in cols.get("StageVariables", []):
+                cname = item.get("Name", "")
+                expr = item.get("Expression", "")
+                if cname and expr:
+                    parts.append(f"STAGE_VAR: {cname} = {expr}")
+
+        elif "Aggregator" in stype:
+            gb = [item.get("KeyName", item.get("ColumnName", "")) for item in cols.get("GroupByKeys", [])]
+            if gb:
+                parts.append(f"GROUP BY: {', '.join(filter(None, gb))}")
+            for item in cols.get("Aggregations", []):
+                out_col = item.get("ColumnName", "")
+                func = item.get("AggregationFunction", item.get("Function", ""))
+                src_col = item.get("SourceColumn", item.get("InputColumn", ""))
+                if out_col and func:
+                    parts.append(f"AGG: {out_col} = {func}({src_col})")
+            for item in cols.get("Derivations", []):
+                cname = item.get("ColumnName", "")
+                expr = item.get("Expression", "")
+                if cname and expr:
+                    parts.append(f"PRE-AGG: {cname} = {expr}")
+
+        elif "Filter" in stype:
+            wc = props.get("WhereClause", "")
+            if wc:
+                parts.append(f"WHERE: {wc}")
+            for item in cols.get("Conditions", []):
+                lnk = item.get("LinkName", "")
+                expr = item.get("Expression", "")
+                if expr:
+                    parts.append(f"CONDITION [{lnk}]: {expr}")
+            for item in cols.get("Derivations", []):
+                cname = item.get("ColumnName", "")
+                expr = item.get("Expression", "")
+                if cname and expr:
+                    parts.append(f"PRE-FILTER: {cname} = {expr}")
+
+        elif "Lookup" in stype:
+            fail = props.get("LookupFail", "Drop")
+            join_type = "INNER JOIN" if fail == "Drop" else "LEFT OUTER JOIN"
+            parts.append(f"LOOKUP TYPE: {join_type} (LookupFail={fail})")
+            for item in cols.get("JoinKeys", []):
+                left = item.get("LeftKey", item.get("SourceKey", ""))
+                right = item.get("RightKey", item.get("LookupKey", ""))
+                if left and right:
+                    parts.append(f"LOOKUP KEY: {left} = {right}")
+            for item in cols.get("Derivations", []):
+                cname = item.get("ColumnName", "")
+                expr = item.get("Expression", "")
+                if cname and expr:
+                    parts.append(f"LOOKUP DERIVE: {cname} = {expr}")
+
+        elif "Join" in stype:
+            jtype = props.get("JoinType", props.get("JoinMode", "Inner"))
+            parts.append(f"JOIN TYPE: {jtype}")
+            for item in cols.get("JoinKeys", []):
+                left = item.get("LeftKey", item.get("KeyA", ""))
+                right = item.get("RightKey", item.get("KeyB", ""))
+                if left and right:
+                    parts.append(f"JOIN KEY: {left} = {right}")
+            for item in cols.get("Derivations", []):
+                cname = item.get("ColumnName", "")
+                expr = item.get("Expression", "")
+                if cname and expr:
+                    parts.append(f"JOIN DERIVE: {cname} = {expr}")
+
+        elif "Merge" in stype:
+            for item in cols.get("JoinKeys", []):
+                key = item.get("KeyName", "")
+                if key:
+                    parts.append(f"MERGE KEY: {key}")
+            mode = props.get("MatchMode", "")
+            if mode:
+                parts.append(f"MERGE MODE: {mode}")
+
+        elif "Sort" in stype:
+            for item in cols.get("SortKeys", []):
+                col = item.get("ColumnName", item.get("KeyName", ""))
+                direction = item.get("SortOrder", item.get("Direction", "Ascending"))
+                if col:
+                    parts.append(f"SORT: {col} {direction}")
+
+        elif any(x in stype for x in ["RemoveDuplicates", "Remove Duplicates", "Distinct"]):
+            keys = [item.get("ColumnName", item.get("KeyName", "")) for item in cols.get("DuplicateKeys", [])]
+            if keys:
+                parts.append(f"DEDUP KEYS: {', '.join(filter(None, keys))}")
+            retention = props.get("RetentionRule", props.get("DuplicateRetention", ""))
+            if retention:
+                parts.append(f"RETENTION: {retention}")
+
+        elif any(x in stype for x in ["RowGenerator", "Row Generator"]):
+            for item in cols.get("GeneratedColumns", []) + cols.get("Derivations", []):
+                cname = item.get("ColumnName", "")
+                expr = item.get("Expression", item.get("Value", ""))
+                if cname and expr:
+                    parts.append(f"GENERATE: {cname} = {expr}")
+            rc = props.get("NumberOfRows", props.get("RowCount", ""))
+            if rc:
+                parts.append(f"ROW COUNT: {rc}")
+
+        elif any(x in stype for x in ["ColumnGenerator", "Column Generator"]):
+            for item in cols.get("GeneratedColumns", []) + cols.get("Derivations", []):
+                cname = item.get("ColumnName", "")
+                expr = item.get("Expression", item.get("Value", ""))
+                if cname and expr:
+                    parts.append(f"GENERATE: {cname} = {expr}")
+
+        elif "Copy" in stype:
+            for item in cols.get("ColumnMappings", []):
+                src = item.get("SourceColumn", "")
+                tgt = item.get("TargetColumn", item.get("ColumnName", ""))
+                if src and tgt and src != tgt:
+                    parts.append(f"RENAME: {src} -> {tgt}")
+            for item in cols.get("Derivations", []):
+                cname = item.get("ColumnName", "")
+                expr = item.get("Expression", "")
+                if cname and expr:
+                    parts.append(f"COPY DERIVE: {cname} = {expr}")
+
+        else:
+            # Source/Target connectors
+            fname = props.get("FileName", "")
+            tname = props.get("TableName", "")
+            sql = props.get("SQLSelect", props.get("Query", ""))
+            schema = props.get("SchemaName", "")
+            if fname:
+                parts.append(f"FILE: {fname}")
+            if schema and tname:
+                parts.append(f"TABLE: {schema}.{tname}")
+            elif tname:
+                parts.append(f"TABLE: {tname}")
+            if sql:
+                parts.append(f"SQL: {sql}")
+            # Oracle connector specific
+            conn_name = props.get("ConnectionString", "")
+            if conn_name:
+                parts.append(f"CONNECTION: {conn_name}")
+            user = props.get("Username", "")
+            if user:
+                parts.append(f"USER: {user}")
+
+        return " | ".join(parts) if parts else "Pass-through"
+
+
+# =============================================================================
+# COLUMN LINEAGE TRACER
+# =============================================================================
+
+class LineageTracer:
+    def __init__(self, parser: DataStageParser):
+        self.parser = parser
+        self.extractor = LogicExtractor()
+        self.rows = []
+
+    def build(self):
+        targets = self.parser.get_targets()
+        sources = self.parser.get_sources()
+        source_names = {s["Properties"].get("Name") for s in sources}
+
+        for target in targets:
+            target_name = target["Properties"].get("Name", "")
+            for in_link in self.parser.incoming.get(target_name, []):
+                columns = in_link["Collections"].get("Columns", [])
+                for col in columns:
+                    tgt_col = col.get("Name", "")
+                    tgt_dtype = format_dtype(
+                        col.get("SqlType", col.get("DataType", "")),
+                        col.get("Precision", ""),
+                        col.get("Scale", "")
+                    )
+                    src_info, logic_path = self._trace(tgt_col, in_link, source_names, visited=set())
+                    self.rows.append({
+                        "Source Column Name": src_info.get("column", tgt_col),
+                        "Source Data Type": src_info.get("dtype", ""),
+                        "Extraction Logic": " | ".join(logic_path) if logic_path else "Direct Pass-through",
+                        "Target Column Name": tgt_col,
+                        "Target Data Type": tgt_dtype,
+                    })
+        return self.rows
+
+    def _trace(self, column_name: str, current_link: dict, source_names: set, visited: set):
+        from_stage_name = current_link["Properties"].get("FromStage")
+        if not from_stage_name:
+            return {"column": column_name, "dtype": ""}, []
+        if from_stage_name in visited:
+            return {"column": column_name, "dtype": ""}, []
+        visited.add(from_stage_name)
+
+        stage = self.parser.stage_by_name.get(from_stage_name)
+        if not stage:
+            return {"column": column_name, "dtype": ""}, []
+
+        logic_str = self.extractor.extract(stage)
+        logic_entries = []
+        if logic_str and logic_str != "Pass-through":
+            logic_entries.append(f"[{from_stage_name}] {logic_str}")
+
+        stype = stage.get("CleanStageType", "")
+        cols = stage["Collections"]
+        upstream_col = column_name
+        is_derived = False
+        rename_info = None
+
+        if "Transformer" in stype:
+            for item in cols.get("Derivations", []):
+                if ci_match(item.get("ColumnName", ""), column_name):
+                    expr = item.get("Expression", "")
+                    simple_ref = self._is_simple_column_ref(expr)
+                    if simple_ref and not ci_match(simple_ref, column_name):
+                        upstream_col = simple_ref
+                        rename_info = f"RENAME: {simple_ref} -> {column_name}"
+                    else:
+                        ref_cols = self._extract_column_refs(expr)
+                        if ref_cols:
+                            upstream_col = ref_cols[0]
+                        else:
+                            is_derived = True
+                    break
+
+        elif "Aggregator" in stype:
+            for item in cols.get("Aggregations", []):
+                if ci_match(item.get("ColumnName", ""), column_name):
+                    upstream_col = item.get("SourceColumn", item.get("InputColumn", column_name))
+                    is_derived = True
+                    break
+
+        elif "Copy" in stype:
+            for item in cols.get("ColumnMappings", []):
+                if ci_match(item.get("TargetColumn", item.get("ColumnName", "")), column_name):
+                    upstream_col = item.get("SourceColumn", column_name)
+                    if not ci_match(upstream_col, column_name):
+                        rename_info = f"RENAME: {upstream_col} -> {column_name}"
+                    break
+
+        elif any(x in stype for x in ["RowGenerator", "Row Generator", "ColumnGenerator", "Column Generator"]):
+            for item in cols.get("GeneratedColumns", []) + cols.get("Derivations", []):
+                if ci_match(item.get("ColumnName", ""), column_name):
+                    is_derived = True
+                    break
+
+        if rename_info:
+            logic_entries.append(f"[{from_stage_name}] {rename_info}")
+
+        if from_stage_name in source_names:
+            dtype = self._find_dtype_on_link(upstream_col, current_link)
+            if is_derived and not dtype:
+                return {"column": f"(Derived) {column_name}", "dtype": ""}, []
+            return {"column": upstream_col, "dtype": dtype}, []
+
+        in_links = self.parser.incoming.get(from_stage_name, [])
+        for il in in_links:
+            link_cols = il["Collections"].get("Columns", [])
+            if self._link_has_column(link_cols, upstream_col):
+                src_info, upstream_logic = self._trace(upstream_col, il, source_names, visited)
+                return src_info, upstream_logic + logic_entries
+
+        if in_links:
+            src_info, upstream_logic = self._trace(upstream_col, in_links[0], source_names, visited)
+            return src_info, upstream_logic + logic_entries
+
+        if is_derived:
+            return {"column": f"(Derived) {column_name}", "dtype": ""}, logic_entries
+        return {"column": upstream_col, "dtype": ""}, logic_entries
+
+    def _find_dtype_on_link(self, col_name: str, link: dict) -> str:
+        for c in link["Collections"].get("Columns", []):
+            if ci_match(c.get("Name", ""), col_name):
+                return format_dtype(
+                    c.get("SqlType", c.get("DataType", "")),
+                    c.get("Precision", ""),
+                    c.get("Scale", "")
+                )
+        return ""
+
+    def _link_has_column(self, link_columns: list, col_name: str) -> bool:
+        return any(ci_match(c.get("Name", ""), col_name) for c in link_columns)
+
+    @staticmethod
+    def _is_simple_column_ref(expression: str):
+        if not expression:
+            return None
+        expr = expression.strip().strip('"').strip("'")
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
+            return expr
+        return None
+
+    @staticmethod
+    def _extract_column_refs(expression: str) -> list:
+        if not expression:
+            return []
+        cleaned = expression
+        cleaned = re.sub(r'"[^"]*"', "", cleaned)
+        cleaned = re.sub(r"'[^']*'", "", cleaned)
+        keywords = [
+            r'CurrentDate', r'CurrentTimestamp', r'NULL', r'TRUE', r'FALSE',
+            r'SEQ\.NEXTVAL', r'SEQ\.CURRVAL',
+            r'Trim', r'Upper', r'Lower', r'Substring', r'Left', r'Right',
+            r'Mod', r'Round', r'Abs', r'Len', r'Concat',
+            r'Case', r'When', r'Then', r'Else', r'End',
+            r'If', r'And', r'Or', r'Not', r'Is', r'Null', r'As',
+            r'Cast', r'To_Date', r'To_Char', r'Nvl', r'Decode',
+            r'In', r'Between', r'Like',
+        ]
+        for kw in keywords:
+            cleaned = re.sub(r'\b' + kw + r'\b', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\b\d+\b', '', cleaned)
+        cleaned = re.sub(r'[+\-*/(),=<>!:&|]', ' ', cleaned)
+        tokens = [t.strip() for t in cleaned.split() if t.strip() and len(t.strip()) > 1]
+        sql_keywords = {"select", "from", "where", "group", "by", "having", "order",
+                        "join", "inner", "outer", "left", "right", "full", "on", "as",
+                        "distinct", "all", "union", "intersect", "minus"}
+        refs = [t for t in tokens if t.lower() not in sql_keywords]
+        return refs
+
+
+# =============================================================================
+# EXCEL WRITER
+# =============================================================================
+
+def write_excel(rows: list, output_path: str):
+    if not rows:
+        print("\n⚠️  WARNING: No lineage rows found.")
+        df = pd.DataFrame(columns=[
+            "Source Column Name", "Source Data Type",
+            "Extraction Logic", "Target Column Name", "Target Data Type"
+        ])
+    else:
+        df = pd.DataFrame(rows)
+        df = df[[
+            "Source Column Name", "Source Data Type",
+            "Extraction Logic", "Target Column Name", "Target Data Type"
+        ]]
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Column Lineage")
+        ws = writer.sheets["Column Lineage"]
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_len = max(max_len, len(str(cell.value)))
+                except:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
+
+    print(f"\n{'='*60}")
+    print(f"✅  EXCEL REPORT GENERATED!")
+    print(f"{'='*60}")
+    print(f"   File: {os.path.abspath(output_path)}")
+    print(f"   Total lineage rows: {len(df)}")
+    print(f"{'='*60}\n")
+
+
+# =============================================================================
+# INTERACTIVE MENU
+# =============================================================================
+
+def find_files(directory="."):
+    folder = Path(directory)
+    files = sorted(list(folder.glob("*.xml")) + list(folder.glob("*.dsx")))
+    return files
+
+
+def show_menu(files):
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("=" * 70)
+    print("   DATASTAGE XML COLUMN LINEAGE EXTRACTOR")
+    print("=" * 70)
+    print(f"\n   Found {len(files)} file(s) in current directory:\n")
+    print(f"   {'#':<4} {'File Name':<50} {'Size'}")
+    print(f"   {'-'*4} {'-'*50} {'-'*10}")
+    for i, f in enumerate(files, 1):
+        size = f.stat().st_size
+        size_str = f"{size:,} bytes" if size < 1024*1024 else f"{size/(1024*1024):.1f} MB"
+        print(f"   {i:<4} {f.name:<50} {size_str}")
+    print(f"\n   {'0':<4} Exit")
+    print("=" * 70)
+
+
+def get_user_choice(max_num):
+    while True:
+        try:
+            choice = input(f"\n   ➤  Enter the number of the file to process: ").strip()
+            if not choice:
+                continue
+            num = int(choice)
+            if num == 0:
+                print("\n   Exiting... Goodbye!")
+                sys.exit(0)
+            if 1 <= num <= max_num:
+                return num
+            print(f"   ⚠️  Please enter a number between 1 and {max_num}, or 0 to exit.")
+        except ValueError:
+            print("   ⚠️  Invalid input. Please enter a valid number.")
+
+
+def process_selected_file(xml_path):
+    print(f"\n   📄 Reading file: {xml_path.name}")
+    print(f"   {'─'*60}")
+
+    try:
+        parser = DataStageParser(str(xml_path))
+    except Exception as e:
+        print(f"\n   ❌ ERROR: Failed to parse file: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    print(f"   ✓ Stages found:      {len(parser.stages)}")
+    print(f"   ✓ Links found:       {len(parser.links)}")
+    sources = parser.get_sources()
+    targets = parser.get_targets()
+    print(f"   ✓ Source stages:     {[s['Properties'].get('Name') for s in sources]}")
+    print(f"   ✓ Target stages:     {[s['Properties'].get('Name') for s in targets]}")
+
+    if len(parser.stages) == 0:
+        print("\n   ⚠️  No stages found! The file may not be a valid DataStage job export.")
+        return False
+
+    print(f"\n   🔍 Tracing column lineage...")
+    tracer = LineageTracer(parser)
+    rows = tracer.build()
+
+    base_name = xml_path.stem
+    output_path = xml_path.parent / f"{base_name}_lineage.xlsx"
+
+    write_excel(rows, str(output_path))
+    return True
+
+
+def main():
+    try:
+        import openpyxl
+    except ImportError:
+        print("\n" + "="*60)
+        print("ERROR: openpyxl is required.")
+        print("Install it using:  pip install pandas openpyxl")
+        print("="*60)
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+
+    files = find_files()
+    if not files:
+        print("\n" + "="*60)
+        print("No .xml or .dsx files found in the current directory.")
+        print(f"Current directory: {os.path.abspath('.')}")
+        print("="*60)
+        print("\nPlease place your DataStage files in this folder and run again.")
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+
+    while True:
+        show_menu(files)
+        choice = get_user_choice(len(files))
+        selected_file = files[choice - 1]
+
+        success = process_selected_file(selected_file)
+
+        if success:
+            print("   What would you like to do next?")
+            print("   1. Process another file")
+            print("   2. Exit")
+            next_action = input("\n   ➤  Enter choice (1 or 2): ").strip()
+            if next_action == "2":
+                print("\n   Exiting... Goodbye!")
+                break
+        else:
+            input("\n   Press Enter to return to menu...")
+
+
+if __name__ == "__main__":
+    main()
